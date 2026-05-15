@@ -1,0 +1,5 @@
+streamlit
+sounddevice
+numpy
+requests
+faster-whisper
