@@ -6,14 +6,22 @@ import threading
 import requests
 import webrtcvad
 from faster_whisper import WhisperModel
+import time
 
 # =====================================================
 # CONFIG
 # =====================================================
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 1024
+FRAME_MS = 30
+FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)
 
+# =====================================================
+# QUEUES (THREAD SAFE PIPELINE)
+# =====================================================
 audio_queue = queue.Queue()
+text_queue = queue.Queue()
+ui_queue = queue.Queue()
 
 # =====================================================
 # SESSION STATE
@@ -25,16 +33,16 @@ if "buffer" not in st.session_state:
     st.session_state.buffer = []
 
 # =====================================================
-# WHISPER (LOCAL)
+# WHISPER MODEL
 # =====================================================
 model = WhisperModel("base", compute_type="int8")
 
 def transcribe(audio):
     segments, _ = model.transcribe(audio, language="el")
-    return " ".join([s.text for s in segments])
+    return " ".join([s.text for s in segments]).strip()
 
 # =====================================================
-# OLLAMA CORRECTION
+# LLM CORRECTION (OPTIONAL)
 # =====================================================
 def correct(text):
     try:
@@ -47,7 +55,7 @@ You are a Greek radiology dictation assistant.
 
 RULES:
 - Do NOT change meaning
-- Only fix grammar
+- Fix grammar only
 - Normalize medical terminology
 - Output clean radiology report style text
 
@@ -55,44 +63,50 @@ TEXT:
 {text}
 """,
                 "stream": False
-            }
+            },
+            timeout=10
         )
-        return r.json()["response"]
+        return r.json().get("response", text).strip()
     except:
         return text
 
 # =====================================================
-# VAD (VOICE ACTIVITY DETECTION)
+# VAD
 # =====================================================
 vad = webrtcvad.Vad(2)
 
-recording = False
 speech_buffer = []
+recording = False
 
-def is_speech(frame):
+def is_speech(pcm_chunk: bytes):
     try:
-        return vad.is_speech(frame, SAMPLE_RATE)
+        return vad.is_speech(pcm_chunk, SAMPLE_RATE)
     except:
         return False
 
-def audio_callback(indata, frames, time, status):
-    global recording, speech_buffer
+def audio_callback(indata, frames, time_info, status):
+    global speech_buffer, recording
 
-    frame = indata.copy()
+    pcm16 = (indata[:, 0] * 32767).astype(np.int16)
 
-    # convert to 16-bit PCM for VAD
-    pcm = (frame * 32767).astype(np.int16).tobytes()
+    for i in range(0, len(pcm16), FRAME_SAMPLES):
+        chunk = pcm16[i:i + FRAME_SAMPLES]
 
-    if is_speech(pcm[:320]):
-        recording = True
-        speech_buffer.append(frame.copy())
-    else:
-        if recording:
-            if len(speech_buffer) > 0:
+        if len(chunk) < FRAME_SAMPLES:
+            continue
+
+        if is_speech(chunk.tobytes()):
+            recording = True
+            speech_buffer.append(chunk.copy())
+        else:
+            if recording and len(speech_buffer) > 0:
                 audio_queue.put(np.concatenate(speech_buffer))
                 speech_buffer = []
             recording = False
 
+# =====================================================
+# AUDIO STREAM
+# =====================================================
 def start_stream():
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
@@ -105,28 +119,45 @@ def start_stream():
     return stream
 
 # =====================================================
-# PROCESSING LOOP
+# STT WORKER
 # =====================================================
-def process_loop():
+def stt_worker():
     while st.session_state.running:
         try:
             audio = audio_queue.get(timeout=1)
 
-            audio = np.squeeze(audio).astype(np.float32)
+            audio = audio.astype(np.float32).flatten()
 
-            # 1. STT
-            text = transcribe(audio)
-            if not text.strip():
+            # avoid whisper garbage on tiny chunks
+            if len(audio) / SAMPLE_RATE < 1.5:
                 continue
 
-            # 2. LLM correction
-            corrected = correct(text)
+            text = transcribe(audio)
 
-            # 3. Append to report
-            st.session_state.buffer.append(corrected)
+            if text.strip():
+                text_queue.put(text)
 
         except:
             continue
+
+# =====================================================
+# OPTIONAL LLM WORKER
+# =====================================================
+def llm_worker():
+    while st.session_state.running:
+        try:
+            text = text_queue.get(timeout=1)
+            corrected = correct(text)
+            ui_queue.put(corrected)
+        except:
+            continue
+
+# =====================================================
+# UI UPDATE LOOP (MAIN THREAD)
+# =====================================================
+def drain_ui_queue():
+    while not ui_queue.empty():
+        st.session_state.buffer.append(ui_queue.get())
 
 # =====================================================
 # UI
@@ -135,21 +166,38 @@ st.title("🏥 Offline Greek Radiology Dictation System")
 
 col1, col2, col3 = st.columns(3)
 
+stream_ref = {"stream": None}
+
 with col1:
     if st.button("🎤 Start Dictation"):
         st.session_state.running = True
-        start_stream()
-        threading.Thread(target=process_loop, daemon=True).start()
+
+        stream_ref["stream"] = start_stream()
+
+        threading.Thread(target=stt_worker, daemon=True).start()
+        threading.Thread(target=llm_worker, daemon=True).start()
 
 with col2:
     if st.button("⛔ Stop"):
         st.session_state.running = False
+
+        try:
+            if stream_ref["stream"]:
+                stream_ref["stream"].stop()
+                stream_ref["stream"].close()
+        except:
+            pass
 
 with col3:
     if st.button("🧹 Clear"):
         st.session_state.buffer = []
 
 st.divider()
+
+# =====================================================
+# DRAIN QUEUES SAFELY
+# =====================================================
+drain_ui_queue()
 
 # =====================================================
 # LIVE REPORT
@@ -165,14 +213,19 @@ st.text_area("Draft Report", live_text, height=300)
 # =====================================================
 st.subheader("📋 Final Copy-Ready Report")
 
-final_text = live_text
+st.text_area("Editable Final Report", live_text, height=300)
 
-st.text_area("Editable Final Report", final_text, height=300)
-
-st.code(final_text)
+st.code(live_text)
 
 st.download_button(
     "⬇️ Download Report",
-    final_text,
+    live_text,
     file_name="radiology_report.txt"
 )
+
+# =====================================================
+# AUTO REFRESH WHILE RUNNING
+# =====================================================
+if st.session_state.running:
+    time.sleep(0.2)
+    st.rerun()
